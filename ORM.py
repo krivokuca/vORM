@@ -1,9 +1,9 @@
 from numpy import ndarray
 from datetime import datetime
-import redis
-import ast
-import zlib
 
+from numpy.lib import utils
+from ORMUtils import ORMUtils
+import redis
 
 """
 vORM
@@ -52,7 +52,7 @@ class CacheORM:
             - val_keys (str) :: Key of the values to obtain.
 
         Returns:
-            - results (False|dict) :: Returns a dict of keys given those keys exist. Else, False
+            - results (False|list) :: Returns a list of dicts that contain keys (given those keys exist). Else, False
         """
 
         if cache_key not in self.def_keys:
@@ -61,13 +61,14 @@ class CacheORM:
         result_dict = self._unpack(cache_key)
         if not result_dict:
             return False
+
         result_keys = list(result_dict.keys())
         results = {k: result_dict[k] for k in result_keys}
         return results
 
     def push(self, cache_key, **kvals):
         """
-        Pushes a key-value pair to the database given the caches cache_key
+        Pushes a key-value pair to the cache definition given the caches cache_key
 
         Parameters:
             - cache_key (str) :: The cache to which to write the keypairs to
@@ -110,8 +111,21 @@ class CacheORM:
 
         cache_state.append(app_dict)
 
+        # serialize and push into memory
         serialized_cache_state = self.utils.serialize_dict(cache_state)
         self.redis.set(cache_key, serialized_cache_state)
+
+        # check if the index exists
+        definition_index = DefinitionIndex(
+            cache_key, self.definitions[def_idx])
+
+        if not definition_index.has_index():
+            creation = definition_index.create()
+            if not creation:
+                raise Exception("Error in creating index for definition")
+
+        else:
+            print("nigger")
         return True
 
     def all(self, cache_key):
@@ -124,7 +138,27 @@ class CacheORM:
         Returns:
             - cache(dict|None) :: If no cache exists, None is returned, else the cache is returned
         """
-        return None
+        if cache_key not in self.def_keys:
+            raise Exception("Unknown key `{}`".format(cache_key))
+
+        definition = self.redis.get(cache_key)
+        if not definition:
+            return {}
+        else:
+            definition_dict = self.utils.deserialize_dict(definition)
+            return definition_dict
+
+    def search(self, cache_key):
+        """
+        Given a cache key, this function searches the cache definition for a value corresponding 
+        to the search value passed.
+
+        Parameters:
+            - cache_key (str) :: The key of the cache definition to search through
+            - **kwargs (any) :: Any number of key=value pairs with the value being the search term, 
+                                either as an exact match or as a Like() object
+        """
+        return False
 
     def __repr__(self):
         rep = ""
@@ -200,6 +234,127 @@ class CacheDefinition:
         return {k: None for k in self.repr.keys()}
 
 
+class DefinitionIndex:
+
+    def __init__(self, cache_key, cache_definition):
+        """
+        This class is responsible for managing, creating, updating and deleting cache definition
+        indexes for fast searches. 
+
+        Parameters:
+            - cache_key (str) :: The cache_key
+            - cache_definition (CacheDefinition) :: The cache's definition object
+
+        """
+
+        self.definition = cache_definition
+        self.cache_key = cache_key
+        self.utils = ORMUtils()
+        self.index_key = "_idx_{}".format(cache_key)
+        self.redis = redis.Redis("localhost", port=6379, db=0)
+
+    def create(self):
+        """
+        Creates the cache index. If an index already exists it returns False.
+
+        The cache index is a reverse index which each cache value mapping to a tuple with the first item
+        being the key of the value and the second item being the cache key. For example:
+        {
+            "value1" : ["key1"], ...],
+            "value2" : ["key2"], ...],
+            "value3" : ["key3"], ...]
+        };
+
+        This cache index is then stored in memory, in redis, using the self.index_key
+        Returns:
+            - True | False :: False if it already exists, True if it has been created
+        """
+
+        if self.redis.get(self.index_key):
+            return False
+
+        cache = self.redis.get(self.cache_key)
+        if not cache:
+            return False  # cache is not defined in redis
+
+        # create the reverse index
+        cache = self.utils.deserialize_dict(cache)
+
+        reverse_index = {}
+        for cache_item in cache:
+            for key in list(cache_item.keys()):
+                value = cache_item[key]
+                if value in reverse_index.keys():
+                    reverse_index[value].append(key)
+                else:
+                    reverse_index[value] = [key]
+
+        # save the reverse index
+        serialized_index = self.utils.serialize_dict(reverse_index)
+        self.redis.set(self.index_key, serialized_index)
+        return True
+
+    def update(self, cache_items):
+        """
+        Takes a list of cache dictionaries and adds them to the definitions index. The cache
+        must be initialized
+
+        Parameters:
+            - cache_items (list) :: A list of dictionaries to add to the index
+
+        Returns:
+            - has_added (bool) :: True if the item was successfully added to the index, False
+                                  if it wasnt. Returns False if the cache has not been initialized
+                                  first
+        """
+
+        if not isinstance(cache_items, list):
+            raise Exception("cache_items must be list")
+
+        index_state = self.redis.get(self.index_key)
+
+        if not index_state:
+            return False
+
+        index_state = self.utils.deserialize_dict(index_state)
+
+        def_repr = self.definition.repr
+        for item in cache_items:
+            item_key_list = list(item.keys())
+            # check to see if the dict aligns with the caches representation
+            non_allowed_keys = [
+                x for x in item_key_list if x not in list(def_repr.keys())]
+
+            if len(non_allowed_keys) != 0:
+                raise Exception("Unknown keys in cache_item, cannot cache")
+
+            for key in item_key_list:
+
+                if key in list(index_state.keys()):
+                    index_state[key].append(item[key])
+                else:
+                    index_state[key] = item[key]
+
+        # serialize and push the updated index state to redis
+        serialized_index = self.utils.serialize_dict(index_state)
+        self.redis.set(self.index_key, serialized_index)
+        return True
+
+    def has_index(self):
+        """
+        True if the index exists, False if it does not
+        """
+        index = self.redis.get(self.index_key)
+
+        # since the above is a truthy val (False or bytes) we gotta explicitly convert it
+        if not index:
+            return False
+        return True
+
+# Everything below this line is for the SQL module and is TODO.
+# Prolly should move this to another file but -\_0_/-
+
+
 class BaseORM:
     def __init__(self, table_name, **kwargs):
         """
@@ -243,23 +398,3 @@ class Column:
         ai_operator = " AUTO_INCREMENT" if self.has_auto_increment else ""
         default_operator = f" DEFAULT {self.has_default_val}" if self.has_default_val else ""
         return f"`{self.name}` {self.type}{null_operator}{ai_operator}{default_operator}"
-
-
-class ORMUtils:
-    """
-    Useful functions
-    """
-
-    def serialize_dict(self, d, compress=False):
-        string = str(d)
-        string_bin = string.encode()
-        if compress:
-            string_bin = zlib.compress(string_bin)
-        return string_bin
-
-    def deserialize_dict(self, serialized_dict, decompress=False):
-        if decompress:
-            serialized_dict = zlib.decompress(serialized_dict)
-        d = serialized_dict.decode('utf-8')
-        decoded_dict = ast.literal_eval(d)
-        return decoded_dict
