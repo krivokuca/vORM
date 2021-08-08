@@ -125,7 +125,7 @@ class CacheORM:
                 raise Exception("Error in creating index for definition")
 
         else:
-            print("nigger")
+            print("Debug here")
         return True
 
     def all(self, cache_key):
