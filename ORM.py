@@ -125,7 +125,10 @@ class CacheORM:
                 raise Exception("Error in creating index for definition")
 
         else:
-            print("Debug here")
+            # push the value to the index as well
+            has_updated = definition_index.update(cache_state)
+            if not has_updated:
+                raise Exception("Definition update failure")
         return True
 
     def all(self, cache_key):
@@ -148,17 +151,48 @@ class CacheORM:
             definition_dict = self.utils.deserialize_dict(definition)
             return definition_dict
 
-    def search(self, cache_key):
+    def search(self, cache_key, **kwargs):
         """
         Given a cache key, this function searches the cache definition for a value corresponding 
         to the search value passed.
+
+        TODO: fine tuning still needed to make it faster
 
         Parameters:
             - cache_key (str) :: The key of the cache definition to search through
             - **kwargs (any) :: Any number of key=value pairs with the value being the search term, 
                                 either as an exact match or as a Like() object
+
+        Returns:
+            - results (list) :: A list of returned search results
         """
-        return False
+        # try to load the cache index
+        if cache_key not in self.def_keys:
+            raise Exception(
+                'CacheDefinition with key {} has not been defined'.format(cache_key))
+
+        cache_definition = self.definitions[self.def_keys.index(cache_key)]
+        cache_state = self.all(cache_key)
+
+        if not cache_state:
+            raise Exception(
+                "Cache with key {} does not exist".format(cache_key))
+
+        cache_index = DefinitionIndex(cache_key, cache_definition)
+        index_state = cache_index.get()
+        index_state_keys = list(index_state.keys())
+
+        if not index_state:
+            raise Exception("Index state is not loaded")
+
+        results = []
+        # iterate through each key/value pair looking for it in the index
+        for key, val in kwargs.items():
+            if key in index_state:
+                if val in index_state[key]:
+                    results.append(cache_state[key])
+
+        return results
 
     def __repr__(self):
         rep = ""
@@ -201,6 +235,7 @@ class CacheDefinition:
     def __init__(self, cache_key, **kwargs):
         """
         Defines the schema of the cache object by accepting an arbitrary amount of key-value pairs.
+        This only 
 
         Parameters:
             - cache_key (str) :: The key of the cache (must be unique per cache).
@@ -293,6 +328,21 @@ class DefinitionIndex:
         serialized_index = self.utils.serialize_dict(reverse_index)
         self.redis.set(self.index_key, serialized_index)
         return True
+
+    def get(self):
+        """
+        Returns the full index
+
+        Returns:
+            - index (dict) :: A full version of the index
+        """
+
+        raw_index = self.redis.get(self.index_key)
+        if not raw_index:
+            return False
+
+        index = self.utils.deserialize_dict(raw_index)
+        return index
 
     def update(self, cache_items):
         """
